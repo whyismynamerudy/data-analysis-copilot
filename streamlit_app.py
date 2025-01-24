@@ -66,6 +66,7 @@ def handle_table_change():
             {"role": "bot", "content": "A change was made to the table."}
         )
 
+# below function also generates plan to answer the query / generation request of the client.
 # function to generate the reponse of the chatbot
 def generate_chatbot_response(openai_client, session_state, user_input):
 
@@ -82,6 +83,7 @@ def generate_chatbot_response(openai_client, session_state, user_input):
         + [
             {"role": m["role"], "content": m["content"]} for m in session_state.messages
         ],
+        # "function" but rather a function interface / description of a function interface
         tools=[
             {
                 "type": "function",
@@ -109,6 +111,10 @@ def generate_chatbot_response(openai_client, session_state, user_input):
     # get the tool calls
     tool_calls = response_message.tool_calls
 
+    # the function name is basically the model deciding thiat this tool should be used.
+    # the function specification in the "tools" argument serves as a bridge between the ai's
+    # understanding of available capabilities and the code's implementation of those capabilities
+
     # if the tool is called to generated report
     if tool_calls and tool_calls[0].function.name == "trigger_report_generation":
 
@@ -134,10 +140,11 @@ def generate_chatbot_response(openai_client, session_state, user_input):
                     "content": user_input
                     + """ \n make a plan that is simple to understand without technical terms to create code in python 
 to analyze this data(do not include the code), only include the plan as list of steps in the output. 
-At the same time, you are also given a list of tools, they are python_repl_tool for writing code, and another one is called web_search for searching on the web. 
+At the same time, you are also given a list of tools: 'python_repl_tool' for writing code, and 'web_search' for searching on the web. 
 Please assign the right tool to do each step, knowing the tools that got activated later will know the output of the previous tools. 
 the plan can be hierarchical, meaning that when multiple related and consecutive step can be grouped in one big step and be achieve by the same tool,
-you can group under a parent step and have them as sub-steps and only mention the tool recommended for the partent step. 
+you can group under a parent step and have them as sub-steps and only mention the tool recommended for the parent step. 
+A tool can be used multiples times if necessary. For example, you could use the 'python_repl_tool' to first generate intermediate results, and use it again at a later point if needed.
 At the each parent step of the plan, please indicate the tool you recommend in a [] such as [Tool: web_search], and put it at the begining of that step. Do not indicate the tool recommendation for sub-steps
 In your output please only give one coherent plan with no analysis
                             """
@@ -163,6 +170,8 @@ In your output please only give one coherent plan with no analysis
 
     return response
 
+
+# QUESTION: how does the openai api know what these tools below are the only ones we have acceess to?
 
 # Functions to execute the plan generated
 def execute_plan(plan):
@@ -249,7 +258,8 @@ def format_intermediate_steps(response):
         tool_input = step[0].tool_input
         log = step[0].log.strip()
         formatted_output += f"Invoked `{tool}` with: \n```python\n\n{tool_input}\n```\n\n"
-    formatted_output += f"Final Output: \n `{response["output"]}`"
+    rout = response["output"]
+    formatted_output += f"Final Output: \n `{rout}`"
     return formatted_output
 
 # Function to generate code that is used to display the information within the report
@@ -286,6 +296,40 @@ Only respond with code as plain text without code block syntax around it. Again,
     return code_with_display
 
 
+def regenerate_plan_with_feedback(openai_client, session_state, feedback, plan):
+    result = get_data(session_state.df)
+
+    response = openai_client.chat.completions.create(
+        model=st.session_state["openai_model"],
+        messages=[
+            {"role": "user", "content": f'''
+            Here is the current plan: {plan}.
+            Create a new plan using the feedback provided by the user. Feedback: {feedback}.
+            Here are the instructions for generating a plan:''' +
+            session_state.current_user_input
+                    + '''\n make a plan that is simple to understand without technical terms to create code in python 
+to analyze this data(do not include the code), only include the plan as list of steps in the output. 
+At the same time, you are also given a list of tools: 'python_repl_tool' for writing code, and 'web_search' for searching on the web. 
+Please assign the right tool to do each step, knowing the tools that got activated later will know the output of the previous tools. 
+the plan can be hierarchical, meaning that when multiple related and consecutive step can be grouped in one big step and be achieve by the same tool,
+you can group under a parent step and have them as sub-steps and only mention the tool recommended for the parent step. 
+A tool can be used multiples times if necessary. For example, you could use the 'python_repl_tool' to first generate intermediate results, and use it again at a later point if needed.
+At the each parent step of the plan, please indicate the tool you recommend in a [] such as [Tool: web_search], and put it at the begining of that step. Do not indicate the tool recommendation for sub-steps
+In your output please only give one coherent plan with no analysis
+                            '''
+                    + "\n this is the data \n"
+                    + result + "\n \n ensure that you generate a new plan that follows the intructions and improves upon the old plan using the feedback provided by the user"
+            }
+        ]
+    )
+    new_plan = response.choices[0].message.content
+
+    response = st.write_stream(new_plan)
+    session_state.plan = response
+
+    return response
+
+
 # Initialize the state variables
 if "plan" not in st.session_state:
     st.session_state.plan = ""
@@ -295,6 +339,11 @@ st.write("There is no report created yet, please ask the chatbot to create a rep
 """
 if "thoughtflow" not in st.session_state:
     st.session_state.agent_thoughtflow = ""
+
+if 'updated_plan' not in st.session_state:
+    st.session_state.updated_plan = ""
+if 'plan_feedback' not in st.session_state:
+    st.session_state.plan_feedback = ""
 
 # Below is a method for creating a state variable that auto refreshes on the frontend as the value changes, without the need to manually do st.rerun()
 # Be careful with using it since it uses the special session_state_auto variable, as it could trigger st.rerun() within it and sometimes interrupt other steps.
@@ -373,8 +422,20 @@ with st.container():
             with col2row1_plan_tab:
                 st.write(st.session_state.plan)
 
+                feedback = st.text_area("Provide feedback on the plan:", key="plan_feedback")
+
+                if st.button("Regenerate Plan using Feedback") and feedback:
+                    with chat_history_container.chat_message("assistant"):
+                        response = regenerate_plan_with_feedback(
+                            openai_client, st.session_state, feedback, st.session_state.plan
+                        )
+                    # Append the assistant's response to the chat history
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": response}
+                    )
+
                 # if the execute button is pressed
-                if st.button("Execute Plan"):
+                if st.button("Approve Plan and Execute"):
                     execute_plan(st.session_state.plan)
 
             # display the code for formatting the report
